@@ -1,0 +1,82 @@
+@import "tailwindcss";
+
+/* Class-based theming (html gets .dark or .light) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Map the existing design tokens to Tailwind color utilities.
+   `inline` makes utilities reference var(--bg) etc. directly so the
+   :root/.light overrides below actually switch themes. */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-subtle: var(--bg-subtle);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-soft: var(--accent-soft);
+  --color-card: var(--card);
+  --color-border: var(--border);
+  --color-error: var(--error);
+  --color-success: var(--success);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+/* Default (dark) tokens — unchanged values from the original palette */
+:root {
+  --bg: #0a0a0f;
+  --bg-subtle: #12121a;
+  --fg: #e8e8f0;
+  --muted: #8a8a9e;
+  --accent: #a78bfa;
+  --accent-strong: #8b5cf6;
+  --accent-soft: rgba(167, 139, 250, 0.12);
+  --card: #12121b;
+  --border: #26263a;
+  --error: #f87171;
+  --success: #4ade80;
+  color-scheme: dark;
+}
+
+.light {
+  --bg: #f7f7fb;
+  --bg-subtle: #ffffff;
+  --fg: #14141f;
+  --muted: #5f6472;
+  --accent: #7c3aed;
+  --accent-strong: #6d28d9;
+  --accent-soft: rgba(124, 58, 237, 0.1);
+  --card: #ffffff;
+  --border: #e4e4ef;
+  --error: #dc2626;
+  --success: #059669;
+  color-scheme: light;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background-color: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--fg);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
