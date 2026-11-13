@@ -13,6 +13,7 @@ export type UploadRow = {
   created_at: string;
   expires_at: string;
   download_count: number;
+  pending_delete: number;
 };
 
 export type NewUploadRow = {
@@ -76,6 +77,28 @@ export const incrementDownloadCount = (db: DatabaseSync, id: number): void => {
   db.prepare('UPDATE uploads SET download_count = download_count + 1 WHERE id = ?').run(id);
 };
 
+export const markPendingDelete = (db: DatabaseSync, id: number): void => {
+  db.prepare('UPDATE uploads SET pending_delete = 1 WHERE id = ?').run(id);
+};
+
+/** Rows that are expired or waiting for a retried storage deletion. */
+export const findCleanupCandidates = (
+  db: DatabaseSync,
+  nowIso: string,
+  limit = 200,
+): UploadRow[] => {
+  const rows = db
+    .prepare(
+      `SELECT * FROM uploads
+       WHERE expires_at <= ? OR pending_delete = 1
+       ORDER BY expires_at ASC
+       LIMIT ?`,
+    )
+    .all(nowIso, limit);
+
+  return rows.map((row) => row as UploadRow);
+};
+
 export const findExpiredUploads = (
   db: DatabaseSync,
   nowIso: string,
@@ -100,7 +123,7 @@ export const findRecentActiveUploads = (
   const rows = db
     .prepare(
       `SELECT * FROM uploads
-       WHERE expires_at > ?
+       WHERE expires_at > ? AND pending_delete = 0
        ORDER BY datetime(created_at) DESC, id DESC
        LIMIT ?`,
     )

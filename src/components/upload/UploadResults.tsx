@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -14,6 +14,8 @@ import type { PublicUpload, UploadRejection } from '../../types';
 import { formatBytes } from '../../types';
 import { formatDateTime, formatRemaining } from '../../utils/dates';
 import { deleteUpload, toAbsoluteUrl } from '../../utils/api';
+import { removeDeleteCapability, saveDeleteCapabilities } from '../../utils/deleteVault';
+import { DeleteConfirmDialog } from '../display/DeleteConfirmDialog';
 
 type UploadResultsProps = {
   uploads: PublicUpload[];
@@ -27,6 +29,12 @@ export const UploadResults = ({ uploads, rejections, onReset, onDeleted }: Uploa
   const [pendingDelete, setPendingDelete] = useState<PublicUpload | null>(null);
   const [deletingToken, setDeletingToken] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // The delete token only ever arrives in the upload response; keep it in this
+  // browser so the file can still be deleted after a refresh.
+  useEffect(() => {
+    void saveDeleteCapabilities(uploads);
+  }, [uploads]);
 
   const handleCopy = async (upload: PublicUpload) => {
     const link = toAbsoluteUrl(upload.sharePath);
@@ -49,6 +57,7 @@ export const UploadResults = ({ uploads, rejections, onReset, onDeleted }: Uploa
 
     try {
       await deleteUpload(target.deleteToken as string);
+      await removeDeleteCapability(target.token);
       setPendingDelete(null);
       onDeleted(target.token);
     } catch (cause) {
@@ -73,6 +82,9 @@ export const UploadResults = ({ uploads, rejections, onReset, onDeleted }: Uploa
             </p>
             <p className="mt-1 text-xs leading-relaxed text-success/90">
               Share these links with anyone — no account needed to download.
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-muted">
+              One-time links: each file is deleted after its first complete download.
             </p>
           </div>
           <button
@@ -206,64 +218,13 @@ export const UploadResults = ({ uploads, rejections, onReset, onDeleted }: Uploa
       )}
 
       {pendingDelete && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
-          onClick={() => {
-            if (!deletingToken) setPendingDelete(null);
-          }}
-        >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="delete-dialog-title"
-            className="w-full max-w-md rounded-2xl border border-border bg-card p-6 shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="flex items-center gap-2.5">
-              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-error/10 text-error">
-                <Trash2 className="h-4 w-4" aria-hidden="true" />
-              </span>
-              <h2 id="delete-dialog-title" className="text-base font-semibold">
-                Delete this file permanently?
-              </h2>
-            </div>
-
-            <p className="mt-4 text-sm leading-relaxed text-muted">
-              <span className="font-medium text-fg">{pendingDelete.filename}</span> will be removed
-              from the server. Its sharing link will stop working immediately and return 404. This
-              cannot be undone.
-            </p>
-
-            {deleteError && (
-              <p role="alert" className="mt-3 rounded-lg border border-error/40 bg-error/10 p-3 text-xs text-error">
-                {deleteError}
-              </p>
-            )}
-
-            <div className="mt-6 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                disabled={Boolean(deletingToken)}
-                onClick={() => setPendingDelete(null)}
-                className="rounded-lg border border-border px-3.5 py-2 text-sm font-medium text-muted transition-colors hover:border-accent/60 hover:text-fg disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleConfirmDelete()}
-                disabled={Boolean(deletingToken)}
-                aria-busy={Boolean(deletingToken)}
-                className="inline-flex items-center gap-2 rounded-lg bg-error px-4 py-2 text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {deletingToken && (
-                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-                )}
-                {deletingToken ? 'Deleting…' : 'Delete permanently'}
-              </button>
-            </div>
-          </div>
-        </div>
+        <DeleteConfirmDialog
+          filename={pendingDelete.filename}
+          busy={Boolean(deletingToken)}
+          error={deleteError}
+          onCancel={() => setPendingDelete(null)}
+          onConfirm={() => void handleConfirmDelete()}
+        />
       )}
     </div>
   );

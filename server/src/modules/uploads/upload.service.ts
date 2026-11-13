@@ -8,12 +8,13 @@ import { logger } from '../../utils/logger.js';
 import { ensureStorageDirs, isInsideStorage, resolveStoragePath } from '../../utils/storage.js';
 import {
   deleteUploadById,
-  findExpiredUploads,
+  findCleanupCandidates,
   findRecentActiveUploads,
   findUploadByDeleteTokenHash,
   findUploadByToken,
   incrementDownloadCount,
   insertUpload,
+  markPendingDelete,
   withTransaction,
 } from './upload.repository.js';
 import type { UploadRow } from './upload.repository.js';
@@ -59,6 +60,22 @@ const safeUnlink = async (filePath: string): Promise<void> => {
     if (code !== 'ENOENT') {
       logger.warn('Failed to delete file', { path: filePath, code });
     }
+  }
+};
+
+/**
+ * Deletes a stored file, reporting whether the filesystem actually let it go.
+ * A missing file counts as removed (idempotent retries).
+ */
+const removeStoredFile = async (filePath: string): Promise<boolean> => {
+  try {
+    await unlink(filePath);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return true;
+    logger.error('Could not remove stored file', { path: filePath, code });
+    return false;
   }
 };
 
@@ -216,7 +233,7 @@ export const createUploads = async (
 
 export const getUploadByToken = (token: string): PublicUpload => {
   const row = findUploadByToken(getDatabase(), token);
-  if (!row) {
+  if (!row || row.pending_delete === 1) {
     throw AppError.notFound('This link does not exist');
   }
   return toPublicUpload(row);
@@ -240,6 +257,12 @@ export const resolveDownload = async (token: string): Promise<ResolvedDownload> 
     throw AppError.expired('This link has expired');
   }
 
+  // A file whose one-time download completed (or whose deletion is awaiting a
+  // retry) is no longer shareable.
+  if (row.pending_delete === 1) {
+    throw AppError.notFound('This file is no longer available');
+  }
+
   if (!isInsideStorage(row.storage_path)) {
     logger.error('Refused to serve file outside storage root', { token });
     throw AppError.notFound('This file is not available');
@@ -260,6 +283,68 @@ export const registerDownload = (id: number): void => {
   incrementDownloadCount(getDatabase(), id);
 };
 
+const finalizing = new Map<string, Promise<boolean>>();
+
+/** In-flight transfers per token, so deletion waits for every reader. */
+const activeDownloads = new Map<string, number>();
+
+export const beginDownload = (token: string): void => {
+  activeDownloads.set(token, (activeDownloads.get(token) ?? 0) + 1);
+};
+
+export const endDownload = (token: string): void => {
+  const remaining = (activeDownloads.get(token) ?? 1) - 1;
+  if (remaining <= 0) {
+    activeDownloads.delete(token);
+    return;
+  }
+  activeDownloads.set(token, remaining);
+};
+
+const finalizeOnce = async (token: string): Promise<boolean> => {
+  const database = getDatabase();
+  const row = findUploadByToken(database, token);
+  if (!row) return false;
+
+  // Another transfer is still reading this file; the last one deletes it.
+  if ((activeDownloads.get(token) ?? 0) > 0) return false;
+
+  if (!isInsideStorage(row.storage_path)) {
+    logger.error('Refused to delete file outside storage root', { token });
+    deleteUploadById(database, row.id);
+    return true;
+  }
+
+  const removed = await removeStoredFile(row.storage_path);
+  if (!removed) {
+    // Keep the record so the cleanup job can retry; sharing is already closed.
+    markPendingDelete(database, row.id);
+    logger.warn('One-time deletion deferred until storage allows it', { id: row.id });
+    return false;
+  }
+
+  deleteUploadById(database, row.id);
+  logger.info('One-time upload deleted after a completed download', { id: row.id });
+  return true;
+};
+
+/**
+ * Called only after a download stream completed successfully. Concurrent
+ * callers for the same token share one deletion attempt, and later callers
+ * simply find no row — so parallel downloads cannot corrupt state.
+ */
+export const finalizeDownloadByToken = (token: string): Promise<boolean> => {
+  const inFlight = finalizing.get(token);
+  if (inFlight) return inFlight;
+
+  const task = finalizeOnce(token).finally(() => {
+    finalizing.delete(token);
+  });
+
+  finalizing.set(token, task);
+  return task;
+};
+
 export type DeletedUpload = { filename: string };
 
 /**
@@ -277,10 +362,14 @@ export const deleteUploadByDeleteToken = async (deleteToken: string): Promise<De
     throw AppError.notFound('This delete link is not valid, or the file was already deleted');
   }
 
-  if (isInsideStorage(row.storage_path)) {
-    await safeUnlink(row.storage_path);
-  } else {
-    logger.error('Skipped deleting file outside storage root', { id: row.id });
+  const removed = isInsideStorage(row.storage_path)
+    ? await removeStoredFile(row.storage_path)
+    : true;
+
+  if (!removed) {
+    // Keep the row (and expose the failure) so the retry job can finish later.
+    markPendingDelete(database, row.id);
+    throw AppError.internal('Could not delete the stored file. Please try again.');
   }
 
   deleteUploadById(database, row.id);
@@ -293,16 +382,23 @@ export type CleanupResult = { removed: number; failed: number };
 
 export const cleanupExpiredUploads = async (limit = 200): Promise<CleanupResult> => {
   const database = getDatabase();
-  const expired = findExpiredUploads(database, new Date().toISOString(), limit);
+  const expired = findCleanupCandidates(database, new Date().toISOString(), limit);
 
   let removed = 0;
   let failed = 0;
 
   for (const row of expired) {
     try {
-      if (isInsideStorage(row.storage_path)) {
-        await safeUnlink(row.storage_path);
+      const fileRemoved = isInsideStorage(row.storage_path)
+        ? await removeStoredFile(row.storage_path)
+        : true;
+
+      if (!fileRemoved) {
+        markPendingDelete(database, row.id);
+        failed += 1;
+        continue;
       }
+
       deleteUploadById(database, row.id);
       removed += 1;
     } catch (error) {

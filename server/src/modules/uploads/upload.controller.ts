@@ -1,12 +1,16 @@
 import { createReadStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import type { Request, RequestHandler } from 'express';
 import { AppError } from '../../utils/errors.js';
 import { logger } from '../../utils/logger.js';
 import { buildContentDisposition } from '../../utils/contentDisposition.js';
 import {
+  beginDownload,
   createUploads,
   deleteUploadByDeleteToken,
   discardTempUploads,
+  endDownload,
+  finalizeDownloadByToken,
   getRecentUploads,
   getUploadByToken,
   registerDownload,
@@ -89,6 +93,7 @@ export const getDownload: RequestHandler = async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
 
   const stream = createReadStream(absolutePath);
+  beginDownload(token);
 
   stream.on('open', () => {
     try {
@@ -101,21 +106,29 @@ export const getDownload: RequestHandler = async (req, res) => {
     }
   });
 
-  stream.on('error', (error) => {
-    logger.error('Download stream failed', {
+  try {
+    // Resolves only when the whole file was flushed to the client. An aborted
+    // download or a client disconnect rejects, leaving the file untouched.
+    await pipeline(stream, res);
+  } catch (error) {
+    logger.warn('Download did not complete; file kept', {
       token,
-      error: error.message,
+      error: error instanceof Error ? error.message : String(error),
     });
     if (!res.headersSent) {
       res.status(500).json({
         error: { code: 'INTERNAL_ERROR', message: 'Could not read the stored file' },
       });
-      return;
+    } else if (!res.writableEnded) {
+      res.destroy();
     }
-    res.destroy(error);
-  });
+    return;
+  } finally {
+    endDownload(token);
+  }
 
-  stream.pipe(res);
+  // One-time link: only a completed transfer consumes the file.
+  await finalizeDownloadByToken(token);
 };
 
 export const deleteUpload: RequestHandler = async (req, res) => {

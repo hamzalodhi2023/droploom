@@ -50,6 +50,19 @@ const migrations: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    name: 'add_upload_pending_delete',
+    up: (db) => {
+      // Set once a one-time download completed (or a deletion could not remove
+      // the file). Rows with this flag are hidden from sharing and retried by
+      // the cleanup job until the storage file is gone.
+      db.exec(`
+        ALTER TABLE uploads ADD COLUMN pending_delete INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS idx_uploads_pending_delete ON uploads (pending_delete);
+      `);
+    },
+  },
 ];
 
 const readUserVersion = (db: DatabaseSync): number => {

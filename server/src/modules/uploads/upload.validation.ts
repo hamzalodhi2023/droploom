@@ -48,6 +48,8 @@ export const resolveExpiryMinutes = (input: UploadRequestInput): number => {
 export const sanitizeOriginalFilename = (filename: string): string => {
   const base = filename.split(/[\\/]/).pop() ?? 'file';
   const cleaned = base
+    // Control characters are exactly what must be stripped here.
+    // oxlint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f]/g, '')
     .replace(/\s+/g, ' ')
     .trim();

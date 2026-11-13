@@ -18,9 +18,13 @@ original file — no account required.
 - **Custom expiry.** Presets (1 hour / 24 hours / 7 days) plus any custom value from 1 to
   10 080 minutes. The server computes `expires_at` from its own clock.
 - **Secure deletion.** Each upload also receives a private delete token (returned once). Only
-  its SHA-256 hash is stored; the public share token cannot delete anything.
+  its SHA-256 hash is stored; the public share token cannot delete anything. Recent uploads
+  can be deleted from the dashboard, using the capability kept in this browser's IndexedDB.
+- **One-time downloads.** A link is consumed only by a *completed* transfer: the file and its
+  record are deleted after the last byte is flushed, never on a page view, an aborted transfer
+  or a client disconnect.
 - **Automatic cleanup.** Expired links stop working immediately, and a job running every
-  minute deletes the expired rows and their files.
+  minute deletes expired rows, files, and any one-time deletion still waiting for storage.
 
 ## Stack
 
@@ -133,15 +137,36 @@ Errors are consistent: `{ "error": { "code": "…", "message": "…", "details":
 
 ## Deleting a file
 
-The success screen keeps the delete capability in React state, so deletion works without an
-account while that tab is open. **Limitation:** because there are no accounts, the delete
-token exists only in that page's memory. Navigating away, reloading or clearing browser data
-loses the ability to delete early — the file still disappears automatically at its expiry
-time. This trade-off is deliberate: a delete capability stored somewhere recoverable would
-also be usable by anyone who obtained it.
+Deletion is available from the upload result panel and from every card under **Recent
+uploads**. Both use the same confirmation dialog (filename, permanent removal, link 404), the
+same loading state and the same error reporting. The recent-uploads API never returns delete
+tokens: the browser keeps the capability it received in the upload response.
+
+Capabilities are stored per browser in IndexedDB (`droploom-delete-vault`). After a reload the
+same browser can still delete its own files; another browser, or the same browser with site
+data cleared, cannot. Those cards show a disabled Delete button with an explanation instead of
+failing silently. Files remain deletable by expiry, by their first complete download, or from
+the original browser.
 
 Deletion removes the physical file and the database row, after which the share link returns
-`404`. Repeating the request returns `404` as well.
+`404`. Repeating the request returns `404` as well. If the filesystem refuses the delete, the
+row is kept marked `pending_delete` (hidden from sharing) so the cleanup job can retry.
+
+## One-time download links
+
+`GET /api/download/:token` streams the file and, **only after the transfer completed**, deletes
+the stored file and the row. The deletion is triggered from the successful
+`stream.pipeline(stream, res)` callback:
+
+- Viewing `GET /api/files/:token` (opening a share page) never deletes anything.
+- An aborted request, a client disconnect or a read error rejects the pipeline; the file is
+  kept and the link can be retried.
+- In-flight transfers are counted per token. Deletion waits until the last reader finishes, so
+  simultaneous downloads all receive the full file and exactly one cleanup happens.
+- If storage refuses deletion, the row is flagged `pending_delete`, sharing immediately returns
+  `404`, and the cleanup job retries; the row is only removed once the file is gone.
+- Download attempts increment `download_count` when the stream opens, including interrupted
+  ones; a completed download removes the row entirely.
 
 ## Storage and security notes
 
@@ -175,15 +200,20 @@ Deletion removes the physical file and the database row, after which the share l
 npm run test:server
 ```
 
-42 integration tests drive the real Express app with real files on disk:
+47 integration tests drive the real Express app with real files on disk:
 
 - **Formats:** PDF, PNG, MP4, ZIP, JS/TS, EXE, unknown extension, no extension,
   `application/octet-stream`, 0-byte rejection, sparse 100 MB + 1 KB rejection (`413`),
   filename preservation and byte-identical downloads.
 - **Sharing:** multiple files per request, unique tokens, metadata without internal paths or
-  delete tokens, download counting, 404 for unknown tokens, recent uploads.
+  delete tokens, 404 for unknown tokens, recent uploads (and that they never expose delete
+  tokens).
 - **Deletion:** delete token ≠ share token, only the hash is stored, invalid/share tokens
   rejected, file and row removed, share link 404 afterwards, repeated deletion handled.
+- **One-time downloads:** deletion only after a completed transfer, metadata reads keeping the
+  file, an interrupted 8 MB download keeping it, a storage failure retaining the row as
+  `pending_delete` with a successful retry, and three simultaneous downloads all receiving the
+  full 2 MB payload with a single deletion and a subsequent `404`.
 - **Expiry:** 1, 5 and 45 minutes, legacy presets, rejection of 0/negative/decimal/>10080
   values, immediate `410` after expiry, and physical deletion during cleanup.
 - **Hardening:** CORS origin filtering, JSON 404s, empty upload rejection.

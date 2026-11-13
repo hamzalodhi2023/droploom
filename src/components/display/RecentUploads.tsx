@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FileList } from './FileList';
+import { DeleteConfirmDialog } from './DeleteConfirmDialog';
 import type { PublicUpload, UploadedFile } from '../../types';
 import { formatBytes } from '../../types';
-import { fetchRecentUploads, toAbsoluteUrl } from '../../utils/api';
+import { deleteUpload, fetchRecentUploads, toAbsoluteUrl } from '../../utils/api';
 import { isExpired } from '../../utils/dates';
+import { readDeleteCapabilities, removeDeleteCapability } from '../../utils/deleteVault';
 
 type RecentUploadsProps = {
   onCopyLink: (link: string) => void;
@@ -25,15 +27,20 @@ const toUploadedFile = (upload: PublicUpload): UploadedFile => ({
 
 export const RecentUploads = ({ onCopyLink, refreshKey = 0 }: RecentUploadsProps) => {
   const [uploads, setUploads] = useState<PublicUpload[] | null>(null);
+  const [capabilities, setCapabilities] = useState<Map<string, string>>(new Map());
   const [error, setError] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<UploadedFile | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     let cancelled = false;
 
-    void fetchRecentUploads()
-      .then((result) => {
+    void Promise.all([fetchRecentUploads(), readDeleteCapabilities()])
+      .then(([result, tokens]) => {
         if (cancelled) return;
         setUploads(result);
+        setCapabilities(tokens);
         setError(null);
       })
       .catch((cause: unknown) => {
@@ -60,6 +67,41 @@ export const RecentUploads = ({ onCopyLink, refreshKey = 0 }: RecentUploadsProps
     [uploads],
   );
 
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete) return;
+
+    const target = pendingDelete;
+    const deleteToken = capabilities.get(target.id);
+
+    if (!deleteToken) {
+      setDeleteError(
+        'This browser does not hold the private delete key for this file, so it cannot be deleted here.',
+      );
+      return;
+    }
+
+    setDeletingId(target.id);
+    setDeleteError(null);
+
+    try {
+      await deleteUpload(deleteToken);
+      await removeDeleteCapability(target.id);
+      setUploads((current) => current?.filter((upload) => upload.token !== target.id) ?? null);
+      setCapabilities((current) => {
+        const next = new Map(current);
+        next.delete(target.id);
+        return next;
+      });
+      setPendingDelete(null);
+    } catch (cause) {
+      setDeleteError(
+        cause instanceof Error ? cause.message : 'Could not delete the file. Please try again.',
+      );
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   if (error) {
     return (
       <div className="rounded-2xl border border-error/40 bg-error/10 px-6 py-8 text-center">
@@ -84,5 +126,33 @@ export const RecentUploads = ({ onCopyLink, refreshKey = 0 }: RecentUploadsProps
     );
   }
 
-  return <FileList files={files} onCopyLink={onCopyLink} />;
+  const deletableIds = new Set(capabilities.keys());
+
+  return (
+    <>
+      <FileList
+        files={files}
+        onCopyLink={onCopyLink}
+        onDelete={(file) => {
+          setDeleteError(null);
+          setPendingDelete(file);
+        }}
+        deletableIds={deletableIds}
+        deletingId={deletingId}
+      />
+
+      {pendingDelete && (
+        <DeleteConfirmDialog
+          filename={pendingDelete.name}
+          busy={deletingId === pendingDelete.id}
+          error={deleteError}
+          onCancel={() => {
+            setPendingDelete(null);
+            setDeleteError(null);
+          }}
+          onConfirm={() => void handleConfirmDelete()}
+        />
+      )}
+    </>
+  );
 };

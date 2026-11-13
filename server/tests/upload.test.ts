@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -10,6 +11,8 @@ import {
   truncateSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer, get as httpGet } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
@@ -132,6 +135,25 @@ const countRows = (): number => {
   return row?.count ?? 0;
 };
 
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A real listening server, needed to abort a download mid-stream. */
+const startServer = async (): Promise<{ close: () => Promise<void>; port: number }> => {
+  const server = createServer(createApp());
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+
+  return {
+    port,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+};
+
+const rowFor = (token: string): { pending_delete: number; download_count: number } | undefined =>
+  getDatabase()
+    .prepare('SELECT pending_delete, download_count FROM uploads WHERE share_token = ?')
+    .get(token) as { pending_delete: number; download_count: number } | undefined;
+
 before(() => {
   mkdirSync(storageFilesDir, { recursive: true });
   mkdirSync(storageTmpDir, { recursive: true });
@@ -148,7 +170,7 @@ describe('Droploom API', () => {
     const response = await api.get('/api/health');
     assert.equal(response.status, 200);
     assert.equal(response.body.database.status, 'ok');
-    assert.equal(response.body.database.schemaVersion, 2);
+    assert.equal(response.body.database.schemaVersion, 3);
   });
 
   describe('universal file formats', () => {
@@ -350,16 +372,17 @@ describe('Droploom API', () => {
       assert.equal(response.headers['x-content-type-options'], 'nosniff');
     });
 
-    it('increments the download counter', async () => {
-      const uploaded = await uploadOne(fixture('notes.txt'), { expiresInMinutes: '60' });
-      const token = (uploaded.body as UploadBody).uploads[0]?.token;
-      assert.ok(token);
+    it('never exposes delete tokens in the recent uploads response', async () => {
+      const uploaded = await uploadOne(fixture('notes.txt'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload?.deleteToken);
 
-      await downloadBuffer(token);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      const response = await api.get('/api/uploads/recent');
+      assert.equal(response.status, 200);
+      const serialized = JSON.stringify(response.body);
 
-      const metadata = await api.get(`/api/files/${token}`);
-      assert.equal((metadata.body as { file: ApiUpload }).file.downloadCount, 1);
+      assert.ok(!serialized.includes('deleteToken'));
+      assert.ok(!serialized.includes(upload.deleteToken as string));
     });
 
     it('returns 404 for an unknown share token', async () => {
@@ -377,6 +400,146 @@ describe('Droploom API', () => {
       const uploads = (response.body as { uploads: ApiUpload[] }).uploads;
       assert.ok(uploads.some((upload) => upload.token === token));
       assert.ok(uploads.length <= 6);
+      assert.ok(uploads.every((upload) => upload.deleteToken === undefined));
+    });
+  });
+
+  describe('one-time download', () => {
+    it('deletes the file and row only after a completed download', async () => {
+      const uploaded = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      const storedPath = storedFileFor(upload);
+      assert.ok(existsSync(storedPath));
+
+      const first = await downloadBuffer(upload.token);
+      assert.equal(first.response.status, 200);
+      assert.deepEqual(first.body, readFileSync(fixture('sample.pdf')));
+
+      await delay(150);
+      assert.equal(existsSync(storedPath), false);
+      assert.equal(rowFor(upload.token), undefined);
+
+      const second = await downloadBuffer(upload.token);
+      assert.equal(second.response.status, 404);
+    });
+
+    it('does not delete when the link is only inspected', async () => {
+      const uploaded = await uploadOne(fixture('notes.txt'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      const metadata = await api.get(`/api/files/${upload.token}`);
+      assert.equal(metadata.status, 200);
+      await delay(100);
+
+      assert.ok(rowFor(upload.token));
+      assert.ok(existsSync(storedFileFor(upload)));
+    });
+
+    it('keeps the file when the download is interrupted', async () => {
+      const bigPath = path.join(workDir, 'interrupt-me.bin');
+      writeFileSync(bigPath, Buffer.alloc(8 * 1024 * 1024, 0x41));
+
+      const uploaded = await uploadOne(bigPath, { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      const server = await startServer();
+      try {
+        await new Promise<void>((resolve) => {
+          const request = httpGet(
+            `http://127.0.0.1:${server.port}/api/download/${upload.token}`,
+            (response) => {
+              response.once('data', () => {
+                request.destroy();
+                resolve();
+              });
+              response.resume();
+            },
+          );
+          request.on('error', () => resolve());
+        });
+        await delay(300);
+      } finally {
+        await server.close();
+      }
+
+      const row = rowFor(upload.token);
+      assert.ok(row, 'record must survive an interrupted download');
+      assert.equal(row.pending_delete, 0);
+      assert.ok(row.download_count >= 1);
+      assert.ok(existsSync(storedFileFor(upload)));
+
+      const retry = await downloadBuffer(upload.token);
+      assert.equal(retry.response.status, 200);
+      assert.equal(retry.body.length, 8 * 1024 * 1024);
+    });
+
+    it('retains the record when storage refuses deletion, then retries', async () => {
+      const uploaded = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      const storedPath = storedFileFor(upload);
+      const contents = readFileSync(fixture('sample.pdf'));
+      assert.ok(existsSync(storedPath));
+
+      chmodSync(storageFilesDir, 0o500); // directory not writable → unlink fails
+      try {
+        const response = await downloadBuffer(upload.token);
+        assert.equal(response.response.status, 200);
+        assert.deepEqual(response.body, contents);
+        // Let the server's post-transfer deletion attempt run while the
+        // directory is still read-only.
+        await delay(300);
+      } finally {
+        chmodSync(storageFilesDir, 0o755);
+      }
+
+      const row = rowFor(upload.token);
+      assert.ok(row, 'record must be retained when storage deletion fails');
+      assert.equal(row.pending_delete, 1);
+      assert.ok(existsSync(storedPath));
+
+      const blocked = await downloadBuffer(upload.token);
+      assert.equal(blocked.response.status, 404);
+
+      const cleanup = await cleanupExpiredUploads();
+      assert.ok(cleanup.removed >= 1);
+      assert.equal(rowFor(upload.token), undefined);
+      assert.equal(existsSync(storedPath), false);
+    });
+
+    it('serves simultaneous downloads consistently, then deletes once', async () => {
+      const bytes = Buffer.alloc(2 * 1024 * 1024, 0x37);
+      const bigPath = path.join(workDir, 'parallel.bin');
+      writeFileSync(bigPath, bytes);
+
+      const uploaded = await uploadOne(bigPath, { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      const storedPath = storedFileFor(upload);
+      const results = await Promise.all([
+        downloadBuffer(upload.token),
+        downloadBuffer(upload.token),
+        downloadBuffer(upload.token),
+      ]);
+
+      for (const result of results) {
+        assert.equal(result.response.status, 200);
+        assert.equal(result.body.length, bytes.length);
+        assert.ok(result.body.equals(bytes));
+      }
+
+      await delay(150);
+      assert.equal(existsSync(storedPath), false);
+      assert.equal(rowFor(upload.token), undefined);
+
+      const after = await downloadBuffer(upload.token);
+      assert.equal(after.response.status, 404);
     });
   });
 
