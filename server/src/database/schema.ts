@@ -37,6 +37,19 @@ const migrations: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 2,
+    name: 'add_upload_delete_token_hash',
+    up: (db) => {
+      // Nullable: rows created before delete support keep NULL and cannot be
+      // deleted without a capability (SQLite unique indexes ignore NULLs).
+      db.exec(`
+        ALTER TABLE uploads ADD COLUMN delete_token_hash TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_delete_token_hash
+          ON uploads (delete_token_hash);
+      `);
+    },
+  },
 ];
 
 const readUserVersion = (db: DatabaseSync): number => {

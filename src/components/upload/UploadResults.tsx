@@ -1,18 +1,32 @@
 import { useState } from 'react';
-import { AlertCircle, Check, CheckCircle2, Copy, Download, ExternalLink } from 'lucide-react';
+import {
+  AlertCircle,
+  Check,
+  CheckCircle2,
+  Copy,
+  Download,
+  ExternalLink,
+  Loader2,
+  ShieldAlert,
+  Trash2,
+} from 'lucide-react';
 import type { PublicUpload, UploadRejection } from '../../types';
 import { formatBytes } from '../../types';
 import { formatDateTime, formatRemaining } from '../../utils/dates';
-import { toAbsoluteUrl } from '../../utils/api';
+import { deleteUpload, toAbsoluteUrl } from '../../utils/api';
 
 type UploadResultsProps = {
   uploads: PublicUpload[];
   rejections: UploadRejection[];
   onReset: () => void;
+  onDeleted: (token: string) => void;
 };
 
-export const UploadResults = ({ uploads, rejections, onReset }: UploadResultsProps) => {
+export const UploadResults = ({ uploads, rejections, onReset, onDeleted }: UploadResultsProps) => {
   const [copiedToken, setCopiedToken] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<PublicUpload | null>(null);
+  const [deletingToken, setDeletingToken] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const handleCopy = async (upload: PublicUpload) => {
     const link = toAbsoluteUrl(upload.sharePath);
@@ -25,6 +39,28 @@ export const UploadResults = ({ uploads, rejections, onReset }: UploadResultsPro
       // Clipboard access can be blocked; the link stays visible and selectable.
     }
   };
+
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete?.deleteToken) return;
+
+    const target = pendingDelete;
+    setDeletingToken(target.token);
+    setDeleteError(null);
+
+    try {
+      await deleteUpload(target.deleteToken as string);
+      setPendingDelete(null);
+      onDeleted(target.token);
+    } catch (cause) {
+      setDeleteError(
+        cause instanceof Error ? cause.message : 'Could not delete the file. Please try again.',
+      );
+    } finally {
+      setDeletingToken(null);
+    }
+  };
+
+  const canDelete = uploads.some((upload) => Boolean(upload.deleteToken));
 
   return (
     <div className="flex flex-col gap-3">
@@ -52,12 +88,10 @@ export const UploadResults = ({ uploads, rejections, onReset }: UploadResultsPro
           {uploads.map((upload) => {
             const link = toAbsoluteUrl(upload.sharePath);
             const isCopied = copiedToken === upload.token;
+            const isDeleting = deletingToken === upload.token;
 
             return (
-              <li
-                key={upload.token}
-                className="rounded-xl border border-border bg-card p-4"
-              >
+              <li key={upload.token} className="rounded-xl border border-border bg-card p-4">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <p className="min-w-0 truncate text-sm font-semibold" title={upload.filename}>
                     {upload.filename}
@@ -108,6 +142,26 @@ export const UploadResults = ({ uploads, rejections, onReset }: UploadResultsPro
                     >
                       <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
                     </a>
+
+                    {upload.deleteToken && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDeleteError(null);
+                          setPendingDelete(upload);
+                        }}
+                        disabled={isDeleting}
+                        aria-label={`Delete ${upload.filename}`}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted transition-colors hover:border-error/60 hover:text-error disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isDeleting ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                        ) : (
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                        )}
+                        Delete
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -119,6 +173,14 @@ export const UploadResults = ({ uploads, rejections, onReset }: UploadResultsPro
             );
           })}
         </ul>
+
+        {canDelete && (
+          <p className="mt-4 flex items-start gap-2 rounded-lg border border-border bg-bg/40 p-3 text-xs leading-relaxed text-muted">
+            <ShieldAlert className="mt-0.5 h-4 w-4 flex-shrink-0 text-accent" aria-hidden="true" />
+            Deleting requires the private key held by this page. If you clear browser data or
+            navigate away, you cannot delete the file before it expires.
+          </p>
+        )}
       </div>
 
       {rejections.length > 0 && (
@@ -140,6 +202,67 @@ export const UploadResults = ({ uploads, rejections, onReset }: UploadResultsPro
               </li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {pendingDelete && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
+          onClick={() => {
+            if (!deletingToken) setPendingDelete(null);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-dialog-title"
+            className="w-full max-w-md rounded-2xl border border-border bg-card p-6 shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center gap-2.5">
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-error/10 text-error">
+                <Trash2 className="h-4 w-4" aria-hidden="true" />
+              </span>
+              <h2 id="delete-dialog-title" className="text-base font-semibold">
+                Delete this file permanently?
+              </h2>
+            </div>
+
+            <p className="mt-4 text-sm leading-relaxed text-muted">
+              <span className="font-medium text-fg">{pendingDelete.filename}</span> will be removed
+              from the server. Its sharing link will stop working immediately and return 404. This
+              cannot be undone.
+            </p>
+
+            {deleteError && (
+              <p role="alert" className="mt-3 rounded-lg border border-error/40 bg-error/10 p-3 text-xs text-error">
+                {deleteError}
+              </p>
+            )}
+
+            <div className="mt-6 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={Boolean(deletingToken)}
+                onClick={() => setPendingDelete(null)}
+                className="rounded-lg border border-border px-3.5 py-2 text-sm font-medium text-muted transition-colors hover:border-accent/60 hover:text-fg disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmDelete()}
+                disabled={Boolean(deletingToken)}
+                aria-busy={Boolean(deletingToken)}
+                className="inline-flex items-center gap-2 rounded-lg bg-error px-4 py-2 text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {deletingToken && (
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                )}
+                {deletingToken ? 'Deleting…' : 'Delete permanently'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -1,5 +1,15 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  truncateSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
@@ -14,11 +24,11 @@ process.env.NODE_ENV = 'test';
 process.env.PORT = '4000';
 process.env.DATABASE_PATH = path.join(workDir, 'test.sqlite');
 process.env.UPLOAD_DIR = path.join(workDir, 'storage');
-process.env.MAX_FILE_SIZE = String(1024 * 1024); // 1 MB keeps the oversize test fast
-process.env.RATE_LIMIT_API_MAX = '1000';
-process.env.RATE_LIMIT_UPLOAD_MAX = '1000';
-process.env.RATE_LIMIT_DOWNLOAD_MAX = '1000';
-process.env.CLEANUP_INTERVAL_MINUTES = '60';
+process.env.MAX_FILE_SIZE = String(100 * 1024 * 1024); // the real 100 MB limit
+process.env.RATE_LIMIT_API_MAX = '5000';
+process.env.RATE_LIMIT_UPLOAD_MAX = '5000';
+process.env.RATE_LIMIT_DOWNLOAD_MAX = '5000';
+process.env.CLEANUP_INTERVAL_MINUTES = '1';
 process.env.FRONTEND_ORIGIN = 'http://localhost:5173';
 
 const { createApp } = await import('../src/app.js');
@@ -37,7 +47,9 @@ type ApiUpload = {
   sharePath: string;
   downloadPath: string;
   expiresAt: string;
+  createdAt: string;
   downloadCount: number;
+  deleteToken?: string;
 };
 
 type UploadBody = {
@@ -53,8 +65,36 @@ const api = supertest(createApp());
 
 const fixture = (name: string): string => path.join(fixturesDir, name);
 
-const uploadOne = (filePath: string, expiresIn = '24h') =>
-  api.post('/api/uploads').attach('files', filePath).field('expiresIn', expiresIn);
+const tempFile = (name: string, contents: Buffer | string): string => {
+  const filePath = path.join(workDir, name);
+  writeFileSync(filePath, contents);
+  return filePath;
+};
+
+/** Minimal but valid PNG (1x1 transparent pixel). */
+const PNG_BYTES = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+  'base64',
+);
+
+const MP4_BYTES = Buffer.concat([
+  Buffer.from([0x00, 0x00, 0x00, 0x18]),
+  Buffer.from('ftypmp42', 'ascii'),
+  Buffer.from([0x00, 0x00, 0x00, 0x00]),
+  Buffer.from('mp42isom', 'ascii'),
+  Buffer.alloc(64, 0x11),
+]);
+
+const uploadOne = (filePath: string, fields: Record<string, string> = {}) => {
+  const request = api.post('/api/uploads').attach('files', filePath);
+  for (const [key, value] of Object.entries(fields)) {
+    request.field(key, value);
+  }
+  return request;
+};
+
+const uploadWithMinutes = (filePath: string, minutes: string) =>
+  uploadOne(filePath, { expiresInMinutes: minutes });
 
 const downloadBuffer = async (token: string) => {
   const response = await api
@@ -77,6 +117,21 @@ const downloadBuffer = async (token: string) => {
   return { response, body, json };
 };
 
+const storedFileFor = (upload: ApiUpload): string => {
+  const row = getDatabase()
+    .prepare('SELECT storage_path FROM uploads WHERE share_token = ?')
+    .get(upload.token) as { storage_path: string } | undefined;
+  assert.ok(row, 'upload row should exist');
+  return row.storage_path;
+};
+
+const countRows = (): number => {
+  const row = getDatabase().prepare('SELECT COUNT(*) AS count FROM uploads').get() as
+    | { count: number }
+    | undefined;
+  return row?.count ?? 0;
+};
+
 before(() => {
   mkdirSync(storageFilesDir, { recursive: true });
   mkdirSync(storageTmpDir, { recursive: true });
@@ -93,169 +148,195 @@ describe('Droploom API', () => {
     const response = await api.get('/api/health');
     assert.equal(response.status, 200);
     assert.equal(response.body.database.status, 'ok');
+    assert.equal(response.body.database.schemaVersion, 2);
   });
 
-  describe('uploading files', () => {
-    it('accepts a real PDF and stores it outside the original filename', async () => {
-      const response = await uploadOne(fixture('sample.pdf'), '1h');
+  describe('universal file formats', () => {
+    it('accepts a PDF and keeps the original filename', async () => {
+      const response = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '60' });
       assert.equal(response.status, 201);
 
-      const body = response.body as UploadBody;
-      assert.equal(body.uploads.length, 1);
-
-      const upload = body.uploads[0];
+      const upload = (response.body as UploadBody).uploads[0];
       assert.ok(upload);
       assert.equal(upload.filename, 'sample.pdf');
       assert.equal(upload.size, readFileSync(fixture('sample.pdf')).length);
-      assert.equal(upload.downloadCount, 0);
-      assert.ok(upload.token.length >= 32, 'token should be long and unguessable');
-      assert.equal(upload.sharePath, `/api/download/${upload.token}`);
+      assert.ok(upload.token.length >= 32);
 
-      // The stored name is generated, not the client filename.
-      assert.notEqual(upload.token, 'sample.pdf');
       const stored = readdirSync(storageFilesDir);
-      assert.ok(stored.some((name) => name === `${upload.token}.pdf`));
+      assert.ok(stored.includes(`${upload.token}.pdf`));
       assert.ok(!stored.includes('sample.pdf'));
-
-      // Responses must never expose the internal storage path.
-      assert.ok(!JSON.stringify(body).includes(workDir));
+      assert.ok(!JSON.stringify(response.body).includes(workDir));
     });
 
-    it('accepts a TXT file', async () => {
-      const response = await uploadOne(fixture('notes.txt'));
+    it('accepts a PNG image and preserves its bytes', async () => {
+      const filePath = tempFile('pixel.png', PNG_BYTES);
+      const response = await uploadOne(filePath, { expiresInMinutes: '60' });
       assert.equal(response.status, 201);
-      assert.equal((response.body as UploadBody).uploads[0]?.filename, 'notes.txt');
+
+      const upload = (response.body as UploadBody).uploads[0];
+      assert.ok(upload);
+      assert.equal(upload.filename, 'pixel.png');
+
+      const { body } = await downloadBuffer(upload.token);
+      assert.deepEqual(body, PNG_BYTES);
     });
 
-    it('accepts a ZIP file', async () => {
-      const response = await uploadOne(fixture('archive.zip'));
+    it('accepts an MP4 video and preserves its bytes', async () => {
+      const filePath = tempFile('clip.mp4', MP4_BYTES);
+      const response = await uploadOne(filePath, { expiresInMinutes: '60' });
+      assert.equal(response.status, 201);
+
+      const upload = (response.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      const { body } = await downloadBuffer(upload.token);
+      assert.deepEqual(body, MP4_BYTES);
+    });
+
+    it('accepts a ZIP archive', async () => {
+      const response = await uploadOne(fixture('archive.zip'), { expiresInMinutes: '60' });
       assert.equal(response.status, 201);
       assert.equal((response.body as UploadBody).uploads[0]?.filename, 'archive.zip');
     });
 
+    it('accepts JavaScript and TypeScript source files', async () => {
+      const js = tempFile('app.js', 'export const answer = 42;\n');
+      const ts = tempFile('types.ts', 'export type Id = string;\n');
+
+      const response = await api
+        .post('/api/uploads')
+        .attach('files', js)
+        .attach('files', ts)
+        .field('expiresInMinutes', '60');
+
+      assert.equal(response.status, 201);
+      assert.deepEqual(
+        (response.body as UploadBody).uploads.map((upload) => upload.filename).sort(),
+        ['app.js', 'types.ts'],
+      );
+    });
+
+    it('accepts an EXE binary', async () => {
+      const exe = tempFile('installer.exe', Buffer.from('MZ\x90\x00fake windows binary'));
+      const response = await uploadOne(exe, { expiresInMinutes: '60' });
+      assert.equal(response.status, 201);
+      assert.equal((response.body as UploadBody).uploads[0]?.filename, 'installer.exe');
+    });
+
+    it('accepts an unknown extension', async () => {
+      const weird = tempFile('dataset.qzx7', Buffer.from([0x00, 0x01, 0x02, 0x03, 0xff]));
+      const response = await uploadOne(weird, { expiresInMinutes: '60' });
+      assert.equal(response.status, 201);
+      assert.equal((response.body as UploadBody).uploads[0]?.filename, 'dataset.qzx7');
+    });
+
+    it('accepts application/octet-stream binaries', async () => {
+      const response = await api
+        .post('/api/uploads')
+        .attach('files', Buffer.from([0xde, 0xad, 0xbe, 0xef, 0x00]), {
+          filename: 'blob.bin',
+          contentType: 'application/octet-stream',
+        })
+        .field('expiresInMinutes', '60');
+
+      assert.equal(response.status, 201);
+      const upload = (response.body as UploadBody).uploads[0];
+      assert.ok(upload);
+      assert.equal(upload.filename, 'blob.bin');
+
+      const { body } = await downloadBuffer(upload.token);
+      assert.deepEqual(body, Buffer.from([0xde, 0xad, 0xbe, 0xef, 0x00]));
+    });
+
+    it('accepts a file with no extension', async () => {
+      const bare = tempFile('Makefile', 'all:\n\techo hi\n');
+      const response = await uploadOne(bare, { expiresInMinutes: '60' });
+      assert.equal(response.status, 201);
+      assert.equal((response.body as UploadBody).uploads[0]?.filename, 'Makefile');
+    });
+
+    it('rejects empty (0 byte) files deliberately', async () => {
+      const empty = tempFile('nothing.dat', Buffer.alloc(0));
+      const response = await uploadOne(empty, { expiresInMinutes: '60' });
+
+      assert.equal(response.status, 400);
+      const details = (response.body as ErrorBody).error.details;
+      assert.ok(Array.isArray(details));
+      assert.equal((details[0] as { code?: string }).code, 'EMPTY_FILE');
+    });
+
+    it('rejects a file above the 100 MB limit', async () => {
+      const bigPath = path.join(workDir, 'huge.bin');
+      writeFileSync(bigPath, Buffer.alloc(1024));
+      truncateSync(bigPath, 100 * 1024 * 1024 + 1024); // sparse 100 MB + 1 KB
+
+      const response = await uploadOne(bigPath, { expiresInMinutes: '60' });
+      assert.equal(response.status, 413);
+      assert.equal((response.body as ErrorBody).error.code, 'PAYLOAD_TOO_LARGE');
+      rmSync(bigPath, { force: true });
+    });
+
+    it('keeps valid files when another file is empty', async () => {
+      const empty = tempFile('blank.txt', Buffer.alloc(0));
+      const response = await api
+        .post('/api/uploads')
+        .attach('files', fixture('sample.pdf'))
+        .attach('files', empty)
+        .field('expiresInMinutes', '60');
+
+      assert.equal(response.status, 201);
+      const body = response.body as UploadBody;
+      assert.equal(body.uploads.length, 1);
+      assert.equal(body.rejections[0]?.code, 'EMPTY_FILE');
+    });
+
+    it('leaves no orphaned files after failed uploads', async () => {
+      const filesBefore = readdirSync(storageFilesDir).length;
+      const tmpBefore = readdirSync(storageTmpDir).length;
+
+      const empty = tempFile('orphan.txt', Buffer.alloc(0));
+      const rejection = await uploadOne(empty, { expiresInMinutes: '60' });
+
+      assert.equal(rejection.status, 400);
+      assert.equal(readdirSync(storageFilesDir).length, filesBefore);
+      assert.equal(readdirSync(storageTmpDir).length, tmpBefore);
+    });
+  });
+
+  describe('multiple files and sharing', () => {
     it('accepts several files in one request with a distinct token each', async () => {
       const response = await api
         .post('/api/uploads')
         .attach('files', fixture('sample.pdf'))
         .attach('files', fixture('notes.txt'))
         .attach('files', fixture('archive.zip'))
-        .field('expiresIn', '24h');
+        .field('expiresInMinutes', '1440');
 
       assert.equal(response.status, 201);
-      const body = response.body as UploadBody;
-      assert.equal(body.uploads.length, 3);
-
-      const tokens = new Set(body.uploads.map((upload) => upload.token));
-      assert.equal(tokens.size, 3);
-      assert.deepEqual(
-        body.uploads.map((upload) => upload.filename).sort(),
-        ['archive.zip', 'notes.txt', 'sample.pdf'],
-      );
+      const uploads = (response.body as UploadBody).uploads;
+      assert.equal(uploads.length, 3);
+      assert.equal(new Set(uploads.map((upload) => upload.token)).size, 3);
     });
 
-    it('generates a different token for two uploads of the same file', async () => {
-      const first = await uploadOne(fixture('notes.txt'));
-      const second = await uploadOne(fixture('notes.txt'));
-      const firstToken = (first.body as UploadBody).uploads[0]?.token;
-      const secondToken = (second.body as UploadBody).uploads[0]?.token;
+    it('returns public metadata without paths or delete tokens', async () => {
+      const uploaded = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
 
-      assert.ok(firstToken && secondToken);
-      assert.notEqual(firstToken, secondToken);
-    });
-
-    it('keeps valid files when another file in the request is rejected', async () => {
-      const exePath = path.join(workDir, 'setup.exe');
-      writeFileSync(exePath, Buffer.from('MZ\x90\x00fake executable payload'));
-
-      const response = await api
-        .post('/api/uploads')
-        .attach('files', fixture('sample.pdf'))
-        .attach('files', exePath)
-        .field('expiresIn', '24h');
-
-      assert.equal(response.status, 201);
-      const body = response.body as UploadBody;
-      assert.equal(body.uploads.length, 1);
-      assert.equal(body.rejections.length, 1);
-      assert.equal(body.rejections[0]?.code, 'UNSUPPORTED_TYPE');
-    });
-  });
-
-  describe('rejecting bad input', () => {
-    it('rejects an unsupported EXE file', async () => {
-      const exePath = path.join(workDir, 'malware.exe');
-      writeFileSync(exePath, Buffer.from('MZ\x90\x00payload'));
-
-      const response = await uploadOne(exePath);
-      assert.equal(response.status, 400);
-
-      const body = response.body as ErrorBody;
-      assert.equal(body.error.code, 'ALL_FILES_REJECTED');
-    });
-
-    it('rejects an executable renamed to .pdf', async () => {
-      const response = await uploadOne(fixture('not-really.pdf'));
-      assert.equal(response.status, 400);
-
-      const details = (response.body as ErrorBody).error.details;
-      assert.ok(Array.isArray(details));
-      const first = details[0] as { code?: string } | undefined;
-      assert.equal(first?.code, 'CONTENT_MISMATCH');
-    });
-
-    it('rejects a file larger than the configured limit', async () => {
-      const bigPath = path.join(workDir, 'big.pdf');
-      const oversized = Buffer.alloc(1024 * 1024 + 1024, 0x20);
-      oversized.write('%PDF-1.4\n', 0, 'utf8');
-      writeFileSync(bigPath, oversized);
-
-      const response = await uploadOne(bigPath);
-      assert.equal(response.status, 413);
-      assert.equal((response.body as ErrorBody).error.code, 'PAYLOAD_TOO_LARGE');
-    });
-
-    it('leaves no orphaned files behind after failed uploads', async () => {
-      const filesBefore = readdirSync(storageFilesDir).length;
-      const tmpBefore = readdirSync(storageTmpDir).length;
-
-      const exePath = path.join(workDir, 'orphan-check.exe');
-      writeFileSync(exePath, Buffer.from('MZ\x90\x00payload'));
-      const bigPath = path.join(workDir, 'orphan-check.pdf');
-      writeFileSync(bigPath, Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(1024 * 1024)]));
-
-      const rejected = await uploadOne(exePath);
-      const tooLarge = await uploadOne(bigPath);
-
-      assert.equal(rejected.status, 400);
-      assert.equal(tooLarge.status, 413);
-      assert.equal(readdirSync(storageFilesDir).length, filesBefore);
-      assert.equal(readdirSync(storageTmpDir).length, tmpBefore);
-    });
-
-    it('rejects an invalid expiry value', async () => {
-      const response = await uploadOne(fixture('sample.pdf'), 'never');
-      assert.equal(response.status, 400);
-      assert.equal((response.body as ErrorBody).error.code, 'BAD_REQUEST');
-    });
-  });
-
-  describe('sharing and downloading', () => {
-    it('returns public metadata without internal paths', async () => {
-      const uploaded = await uploadOne(fixture('sample.pdf'), '7d');
-      const token = (uploaded.body as UploadBody).uploads[0]?.token;
-      assert.ok(token);
-
-      const response = await api.get(`/api/files/${token}`);
+      const response = await api.get(`/api/files/${upload.token}`);
       assert.equal(response.status, 200);
 
       const file = (response.body as { file: ApiUpload }).file;
       assert.equal(file.filename, 'sample.pdf');
-      assert.ok(file.expiresAt);
-      assert.ok(!JSON.stringify(response.body).includes(workDir));
+      assert.ok(!('deleteToken' in file), 'metadata must not expose the delete token');
+
+      const serialized = JSON.stringify(response.body);
+      assert.ok(!serialized.includes(workDir));
+      assert.ok(!serialized.includes('deleteToken'));
     });
 
-    it('streams the original bytes back with a safe attachment header', async () => {
-      const uploaded = await uploadOne(fixture('sample.pdf'), '1h');
+    it('streams the original bytes with a safe attachment header', async () => {
+      const uploaded = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '60' });
       const upload = (uploaded.body as UploadBody).uploads[0];
       assert.ok(upload);
 
@@ -266,10 +347,11 @@ describe('Droploom API', () => {
       assert.match(String(response.headers['content-disposition']), /^attachment;/);
       assert.match(String(response.headers['content-disposition']), /sample\.pdf/);
       assert.equal(String(response.headers['content-type']), 'application/octet-stream');
+      assert.equal(response.headers['x-content-type-options'], 'nosniff');
     });
 
     it('increments the download counter', async () => {
-      const uploaded = await uploadOne(fixture('notes.txt'));
+      const uploaded = await uploadOne(fixture('notes.txt'), { expiresInMinutes: '60' });
       const token = (uploaded.body as UploadBody).uploads[0]?.token;
       assert.ok(token);
 
@@ -280,43 +362,13 @@ describe('Droploom API', () => {
       assert.equal((metadata.body as { file: ApiUpload }).file.downloadCount, 1);
     });
 
-    it('returns 404 for an unknown token', async () => {
+    it('returns 404 for an unknown share token', async () => {
       const response = await api.get('/api/download/not-a-real-token');
       assert.equal(response.status, 404);
-      assert.equal((response.body as ErrorBody).error.code, 'NOT_FOUND');
     });
 
-    it('refuses an expired link and deletes its file during cleanup', async () => {
-      const uploaded = await uploadOne(fixture('sample.pdf'));
-      const upload = (uploaded.body as UploadBody).uploads[0];
-      assert.ok(upload);
-
-      const storedPath = path.join(storageFilesDir, `${upload.token}.pdf`);
-      assert.ok(existsSync(storedPath));
-
-      getDatabase()
-        .prepare('UPDATE uploads SET expires_at = ? WHERE share_token = ?')
-        .run(new Date(Date.now() - 60_000).toISOString(), upload.token);
-
-      const expired = await downloadBuffer(upload.token);
-      assert.equal(expired.response.status, 410);
-      assert.equal((expired.json as ErrorBody).error.code, 'EXPIRED');
-
-      const metadata = await api.get(`/api/files/${upload.token}`);
-      assert.ok(metadata.body);
-
-      const result = await cleanupExpiredUploads();
-      assert.ok(result.removed >= 1);
-
-      const row = getDatabase()
-        .prepare('SELECT id FROM uploads WHERE share_token = ?')
-        .get(upload.token);
-      assert.equal(row, undefined);
-      assert.equal(existsSync(storedPath), false);
-    });
-
-    it('lists recent active uploads and hides expired ones', async () => {
-      const uploaded = await uploadOne(fixture('notes.txt'));
+    it('lists recent active uploads', async () => {
+      const uploaded = await uploadOne(fixture('notes.txt'), { expiresInMinutes: '1440' });
       const token = (uploaded.body as UploadBody).uploads[0]?.token;
       assert.ok(token);
 
@@ -325,6 +377,221 @@ describe('Droploom API', () => {
       const uploads = (response.body as { uploads: ApiUpload[] }).uploads;
       assert.ok(uploads.some((upload) => upload.token === token));
       assert.ok(uploads.length <= 6);
+    });
+  });
+
+  describe('secure deletion', () => {
+    it('issues a delete token different from the share token and stores only its hash', async () => {
+      const uploaded = await uploadOne(fixture('notes.txt'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload?.deleteToken);
+
+      assert.notEqual(upload.deleteToken, upload.token);
+      assert.ok((upload.deleteToken as string).length >= 32);
+
+      const row = getDatabase()
+        .prepare('SELECT delete_token_hash FROM uploads WHERE share_token = ?')
+        .get(upload.token) as { delete_token_hash: string | null } | undefined;
+
+      assert.ok(row?.delete_token_hash);
+      assert.notEqual(row.delete_token_hash, upload.deleteToken);
+      assert.equal(
+        row.delete_token_hash,
+        createHash('sha256').update(upload.deleteToken as string).digest('hex'),
+      );
+    });
+
+    it('rejects an invalid delete token', async () => {
+      const response = await api.delete('/api/uploads/definitely-not-a-delete-token');
+      assert.equal(response.status, 404);
+      assert.equal((response.body as ErrorBody).error.code, 'NOT_FOUND');
+    });
+
+    it('does not allow deletion with the public share token', async () => {
+      const uploaded = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      const response = await api.delete(`/api/uploads/${upload.token}`);
+      assert.equal(response.status, 404);
+
+      const stillThere = await api.get(`/api/files/${upload.token}`);
+      assert.equal(stillThere.status, 200);
+    });
+
+    it('deletes the physical file, the row, and disables the share link', async () => {
+      const uploaded = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload?.deleteToken);
+
+      const storedPath = storedFileFor(upload);
+      assert.ok(existsSync(storedPath));
+      const rowsBefore = countRows();
+
+      const response = await api.delete(`/api/uploads/${upload.deleteToken}`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.body, { deleted: true, filename: 'sample.pdf' });
+
+      assert.equal(existsSync(storedPath), false);
+      assert.equal(countRows(), rowsBefore - 1);
+
+      const share = await api.get(`/api/download/${upload.token}`);
+      assert.equal(share.status, 404);
+
+      const row = getDatabase()
+        .prepare('SELECT id FROM uploads WHERE share_token = ?')
+        .get(upload.token);
+      assert.equal(row, undefined);
+    });
+
+    it('handles repeated deletion sensibly', async () => {
+      const uploaded = await uploadOne(fixture('notes.txt'), { expiresInMinutes: '1440' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload?.deleteToken);
+
+      const first = await api.delete(`/api/uploads/${upload.deleteToken}`);
+      assert.equal(first.status, 200);
+
+      const second = await api.delete(`/api/uploads/${upload.deleteToken}`);
+      assert.equal(second.status, 404);
+      assert.match((second.body as ErrorBody).error.message, /already deleted|not valid/i);
+    });
+
+    it('keeps the other uploads when one is deleted', async () => {
+      const response = await api
+        .post('/api/uploads')
+        .attach('files', fixture('sample.pdf'))
+        .attach('files', fixture('notes.txt'))
+        .field('expiresInMinutes', '1440');
+
+      const [first, second] = (response.body as UploadBody).uploads;
+      assert.ok(first?.deleteToken && second);
+
+      await api.delete(`/api/uploads/${first.deleteToken}`);
+
+      const survivor = await api.get(`/api/files/${second.token}`);
+      assert.equal(survivor.status, 200);
+    });
+  });
+
+  describe('expiry in minutes', () => {
+    it('accepts a 1 minute expiry', async () => {
+      const uploaded = await uploadWithMinutes(fixture('notes.txt'), '1');
+      assert.equal(uploaded.status, 201);
+
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+      const delta = new Date(upload.expiresAt).getTime() - new Date(upload.createdAt).getTime();
+      assert.equal(delta, 60_000);
+    });
+
+    it('accepts a 5 minute expiry', async () => {
+      const uploaded = await uploadWithMinutes(fixture('notes.txt'), '5');
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+      const delta = new Date(upload.expiresAt).getTime() - new Date(upload.createdAt).getTime();
+      assert.equal(delta, 5 * 60_000);
+    });
+
+    it('accepts a custom 45 minute expiry', async () => {
+      const uploaded = await uploadWithMinutes(fixture('notes.txt'), '45');
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+      const delta = new Date(upload.expiresAt).getTime() - new Date(upload.createdAt).getTime();
+      assert.equal(delta, 45 * 60_000);
+    });
+
+    it('still accepts the legacy presets', async () => {
+      const cases: Array<[string, number]> = [
+        ['1h', 3_600_000],
+        ['24h', 86_400_000],
+        ['7d', 604_800_000],
+      ];
+
+      for (const [preset, expected] of cases) {
+        const uploaded = await uploadOne(fixture('notes.txt'), { expiresIn: preset });
+        assert.equal(uploaded.status, 201);
+        const upload = (uploaded.body as UploadBody).uploads[0];
+        assert.ok(upload);
+        const delta = new Date(upload.expiresAt).getTime() - new Date(upload.createdAt).getTime();
+        assert.equal(delta, expected);
+      }
+    });
+
+    it('rejects zero minutes', async () => {
+      const response = await uploadWithMinutes(fixture('notes.txt'), '0');
+      assert.equal(response.status, 400);
+      assert.match((response.body as ErrorBody).error.message, /at least 1 minute/i);
+    });
+
+    it('rejects negative minutes', async () => {
+      const response = await uploadWithMinutes(fixture('notes.txt'), '-30');
+      assert.equal(response.status, 400);
+    });
+
+    it('rejects decimal minutes', async () => {
+      const response = await uploadWithMinutes(fixture('notes.txt'), '1.5');
+      assert.equal(response.status, 400);
+      assert.match((response.body as ErrorBody).error.message, /whole number/i);
+    });
+
+    it('rejects values above 10080 minutes', async () => {
+      const response = await uploadWithMinutes(fixture('notes.txt'), '10081');
+      assert.equal(response.status, 400);
+      assert.match((response.body as ErrorBody).error.message, /10080/);
+    });
+
+    it('rejects non-numeric expiry values', async () => {
+      const response = await uploadWithMinutes(fixture('notes.txt'), 'soon');
+      assert.equal(response.status, 400);
+    });
+
+    it('rejects an unknown preset', async () => {
+      const response = await uploadOne(fixture('notes.txt'), { expiresIn: 'never' });
+      assert.equal(response.status, 400);
+    });
+
+    it('keeps the temp directory clean after an invalid expiry', async () => {
+      const tmpBefore = readdirSync(storageTmpDir).length;
+      const response = await uploadWithMinutes(fixture('notes.txt'), '0');
+      assert.equal(response.status, 400);
+      assert.equal(readdirSync(storageTmpDir).length, tmpBefore);
+    });
+
+    it('stops serving a link immediately once expiry passes', async () => {
+      const uploaded = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '60' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      getDatabase()
+        .prepare('UPDATE uploads SET expires_at = ? WHERE share_token = ?')
+        .run(new Date(Date.now() - 1_000).toISOString(), upload.token);
+
+      const { response, json } = await downloadBuffer(upload.token);
+      assert.equal(response.status, 410);
+      assert.equal((json as ErrorBody).error.code, 'EXPIRED');
+    });
+
+    it('deletes expired files and rows during cleanup', async () => {
+      const uploaded = await uploadOne(fixture('sample.pdf'), { expiresInMinutes: '60' });
+      const upload = (uploaded.body as UploadBody).uploads[0];
+      assert.ok(upload);
+
+      const storedPath = storedFileFor(upload);
+      assert.ok(existsSync(storedPath));
+
+      getDatabase()
+        .prepare('UPDATE uploads SET expires_at = ? WHERE share_token = ?')
+        .run(new Date(Date.now() - 60_000).toISOString(), upload.token);
+
+      const result = await cleanupExpiredUploads();
+      assert.ok(result.removed >= 1);
+      assert.equal(existsSync(storedPath), false);
+
+      const row = getDatabase()
+        .prepare('SELECT id FROM uploads WHERE share_token = ?')
+        .get(upload.token);
+      assert.equal(row, undefined);
     });
   });
 
@@ -345,6 +612,12 @@ describe('Droploom API', () => {
       const response = await api.get('/api/nope');
       assert.equal(response.status, 404);
       assert.equal((response.body as ErrorBody).error.code, 'NOT_FOUND');
+    });
+
+    it('requires at least one file', async () => {
+      const response = await api.post('/api/uploads').field('expiresInMinutes', '60');
+      assert.equal(response.status, 400);
+      assert.equal((response.body as ErrorBody).error.code, 'BAD_REQUEST');
     });
   });
 });

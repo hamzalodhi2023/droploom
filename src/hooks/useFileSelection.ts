@@ -15,7 +15,8 @@ type UseFileSelectionResult = {
 };
 
 /**
- * Holds the locally selected files. Nothing is uploaded — this is frontend state only.
+ * Holds the files selected for the next upload. Validation happens here for
+ * immediate feedback; the server validates independently.
  */
 export const useFileSelection = (): UseFileSelectionResult => {
   const [files, setFiles] = useState<SelectedFile[]>([]);

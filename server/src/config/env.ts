@@ -16,7 +16,7 @@ const EnvSchema = z.object({
   UPLOAD_DIR: z.string().min(1).default('./storage'),
   MAX_FILE_SIZE: z.coerce.number().int().positive().default(100 * 1024 * 1024),
   FRONTEND_ORIGIN: z.string().min(1).default('http://localhost:5173'),
-  CLEANUP_INTERVAL_MINUTES: z.coerce.number().int().positive().default(15),
+  CLEANUP_INTERVAL_MINUTES: z.coerce.number().int().positive().default(1),
   RATE_LIMIT_API_MAX: z.coerce.number().int().positive().default(300),
   RATE_LIMIT_UPLOAD_MAX: z.coerce.number().int().positive().default(20),
   RATE_LIMIT_DOWNLOAD_MAX: z.coerce.number().int().positive().default(120),

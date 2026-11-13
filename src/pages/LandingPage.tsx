@@ -1,6 +1,6 @@
 import { ShieldCheck, Timer, Link2, Sparkles, ArrowRight } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { UploadArea } from '../components/upload/UploadArea';
+import { UploadFlow } from '../components/upload/UploadFlow';
 
 const features = [
   {
@@ -11,7 +11,7 @@ const features = [
   {
     icon: Timer,
     title: 'Expiry control',
-    body: 'Set a lifetime from one hour to thirty days. When the timer runs out, the link stops working.',
+    body: 'Set a lifetime from one minute to seven days. When the timer runs out, the link stops working.',
   },
   {
     icon: Link2,
@@ -23,7 +23,7 @@ const features = [
 const steps = [
   {
     title: 'Upload',
-    body: 'Drag a file into the dropzone or pick one from your device. Nothing leaves your browser in this preview.',
+    body: 'Drag a file into the dropzone or pick one from your device — any file type up to 100 MB.',
   },
   {
     title: 'Generate',
@@ -73,12 +73,9 @@ export const LandingPage = () => {
 
         {/* Dropzone */}
         <div className="mx-auto mt-12 max-w-3xl">
-          <UploadArea
-            onFilesSelected={() => {}}
-          />
-          <p className="mt-3 text-center text-xs text-muted">
-            Preview only — files stay on your device.
-          </p>
+          <div className="rounded-2xl border border-border bg-card p-5 text-left sm:p-6">
+            <UploadFlow heading={null} />
+          </div>
         </div>
       </section>
 

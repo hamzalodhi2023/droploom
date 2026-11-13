@@ -1,4 +1,4 @@
-import type { ExpiryOption, PublicUpload, UploadRejection, UploadResponse } from '../types';
+import type { PublicUpload, UploadRejection, UploadResponse } from '../types';
 
 const API_BASE = '/api';
 
@@ -75,7 +75,7 @@ export const toRejections = (error: ApiError): UploadRejection[] => {
 
 export type UploadFilesArgs = {
   files: readonly File[];
-  expiresIn: ExpiryOption;
+  expiresInMinutes: number;
   onProgress?: (percent: number) => void;
 };
 
@@ -83,7 +83,11 @@ export type UploadFilesArgs = {
  * Uploads real File objects as multipart/form-data via XHR (fetch has no
  * upload progress events in browsers). Resolves only for a 2xx response.
  */
-export const uploadFiles = ({ files, expiresIn, onProgress }: UploadFilesArgs): Promise<UploadResponse> =>
+export const uploadFiles = ({
+  files,
+  expiresInMinutes,
+  onProgress,
+}: UploadFilesArgs): Promise<UploadResponse> =>
   new Promise<UploadResponse>((resolve, reject) => {
     if (files.length === 0) {
       reject(new ApiError('Select at least one file to upload.', 400, 'NO_FILES'));
@@ -94,7 +98,7 @@ export const uploadFiles = ({ files, expiresIn, onProgress }: UploadFilesArgs): 
     for (const file of files) {
       formData.append('files', file, file.name);
     }
-    formData.append('expiresIn', expiresIn);
+    formData.append('expiresInMinutes', String(expiresInMinutes));
 
     const request = new XMLHttpRequest();
     request.open('POST', `${API_BASE}/uploads`);
@@ -164,6 +168,22 @@ export const fetchRecentUploads = async (): Promise<PublicUpload[]> => {
     (item): item is PublicUpload =>
       isRecord(item) && typeof item.token === 'string' && typeof item.filename === 'string',
   );
+};
+
+/**
+ * Permanently deletes an upload using its private delete capability. The
+ * public share token is not accepted by this endpoint.
+ */
+export const deleteUpload = async (deleteToken: string): Promise<void> => {
+  const response = await fetch(`${API_BASE}/uploads/${encodeURIComponent(deleteToken)}`, {
+    method: 'DELETE',
+    headers: { Accept: 'application/json' },
+  });
+
+  if (response.ok) return;
+
+  const raw = await response.text();
+  throw toApiError(response.status, raw);
 };
 
 /** Absolute URL for a share path returned by the API. */
