@@ -4,8 +4,13 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run dev:server & npm run dev:frontend & wait",
+    "dev:frontend": "vite",
+    "dev:server": "npm --prefix server run dev",
     "build": "tsc -b && vite build",
+    "build:server": "npm --prefix server run build",
+    "typecheck:server": "tsc -p server/tsconfig.json --noEmit",
+    "test:server": "npm --prefix server test",
     "lint": "oxlint",
     "preview": "vite preview"
   },

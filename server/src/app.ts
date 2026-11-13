@@ -5,7 +5,8 @@ import helmet from 'helmet';
 import { env } from './config/env.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import { apiRateLimiter } from './middleware/rateLimit.js';
-import { healthRouter } from './routes/health.routes.js';
+import { healthRouter } from './modules/health/health.routes.js';
+import { uploadsRouter } from './modules/uploads/upload.routes.js';
 import { logger } from './utils/logger.js';
 
 const corsOptions: cors.CorsOptions = {
@@ -38,6 +39,7 @@ export const createApp = (): Express => {
   // Health check sits before the limiter so monitors are not rate limited.
   app.use('/api/health', healthRouter);
   app.use('/api', apiRateLimiter);
+  app.use('/api', uploadsRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

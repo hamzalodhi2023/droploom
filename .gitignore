@@ -40,6 +40,8 @@ server/data/
 # Runtime storage for uploaded files
 server/uploads/
 uploads/
+server/storage/*
+!server/storage/.gitkeep
 
 # Temporary / runtime artefacts
 *.tmp

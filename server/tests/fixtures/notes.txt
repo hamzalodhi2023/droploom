@@ -1,0 +1,2 @@
+Droploom integration test note.
+Second line with unicode: café.

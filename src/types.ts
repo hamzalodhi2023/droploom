@@ -22,7 +22,7 @@ export interface FilePreview {
   preview: string | null;
 }
 
-/** A file the user has selected locally (nothing is uploaded). */
+/** A file the user has selected locally, before it is uploaded. */
 export interface SelectedFile {
   id: string;
   file: File;
@@ -43,6 +43,44 @@ export interface FileValidationError {
   code: FileValidationCode;
   message: string;
 }
+
+/* ---------- API contracts ---------- */
+
+export type ExpiryOption = '1h' | '24h' | '7d';
+
+export interface PublicUpload {
+  token: string;
+  filename: string;
+  size: number;
+  mimeType: string;
+  extension: string;
+  createdAt: string;
+  expiresAt: string;
+  downloadCount: number;
+  sharePath: string;
+  downloadPath: string;
+}
+
+export interface UploadRejection {
+  filename: string;
+  code: string;
+  message: string;
+}
+
+export interface UploadResponse {
+  uploads: PublicUpload[];
+  rejections: UploadRejection[];
+}
+
+export const EXPIRY_OPTIONS: ReadonlyArray<{
+  value: ExpiryOption;
+  label: string;
+  description: string;
+}> = [
+  { value: '1h', label: '1 hour', description: 'Disappears quickly' },
+  { value: '24h', label: '24 hours', description: 'The usual choice' },
+  { value: '7d', label: '7 days', description: 'For longer review cycles' },
+];
 
 export function formatBytes(bytes: number, decimals = 2): string {
   if (!+bytes) return '0 Bytes';

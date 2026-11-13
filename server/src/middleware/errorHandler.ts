@@ -1,4 +1,5 @@
 import type { ErrorRequestHandler, RequestHandler } from 'express';
+import multer from 'multer';
 import { ZodError } from 'zod';
 import { env } from '../config/env.js';
 import { AppError } from '../utils/errors.js';
@@ -54,6 +55,20 @@ export const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
       error: {
         code: 'PAYLOAD_TOO_LARGE',
         message: 'Request body is too large',
+      },
+    });
+    return;
+  }
+
+  if (error instanceof multer.MulterError) {
+    const tooLarge = error.code === 'LIMIT_FILE_SIZE';
+    const limitMb = Math.round(env.maxFileSize / (1024 * 1024));
+    res.status(tooLarge ? 413 : 400).json({
+      error: {
+        code: tooLarge ? 'PAYLOAD_TOO_LARGE' : 'INVALID_UPLOAD',
+        message: tooLarge
+          ? `Each file must be ${limitMb} MB or smaller`
+          : `Upload rejected: ${error.message}`,
       },
     });
     return;

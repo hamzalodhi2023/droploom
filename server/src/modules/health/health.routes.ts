@@ -1,7 +1,7 @@
 import { Router } from 'express';
-import { getDatabase } from '../database/connection.js';
-import { LATEST_SCHEMA_VERSION } from '../database/schema.js';
-import { logger } from '../utils/logger.js';
+import { getDatabase } from '../../database/connection.js';
+import { LATEST_SCHEMA_VERSION } from '../../database/schema.js';
+import { logger } from '../../utils/logger.js';
 
 export const healthRouter = Router();
 
